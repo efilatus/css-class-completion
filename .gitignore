@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+/dist/
+
+# OpenIDEA local data
+/.openidea/
+
+# Publisher private keys
+*.key
+
+# Built plugin packages
+*.oiplugin
+/shelf/
+/changelists.json

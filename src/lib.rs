@@ -79,13 +79,16 @@ impl Providers for Main {
             return Vec::new();
         };
 
-        let Some((start, typed)) = class_value_prefix(&doc.text, cursor) else {
+        let Some((start, end, typed)) = class_value_prefix(&doc.text, cursor) else {
             return Vec::new();
         };
 
         let classes = self.load_classes(doc);
 
-        let replace = Range::new(position(&doc.text, start), at);
+        let replace = Range::new(
+            position(&doc.text, start),
+            position(&doc.text, end),
+        );
 
         classes
         .into_iter()
@@ -216,32 +219,59 @@ fn collect_selector_classes(
 }
 
 /// Проверяет, находится ли курсор внутри значения атрибута class.
+/// Проверяет, находится ли курсор внутри значения атрибута class.
+/// Возвращает начало и конец текущего класса и префикс до курсора.
 fn class_value_prefix(
     text: &str,
     cursor: usize,
-) -> Option<(usize, &str)> {
+) -> Option<(usize, usize, &str)> {
     let before = text.get(..cursor)?;
 
     let tag_start = before.rfind('<')?;
-    let tag_end = before.rfind('>');
 
-    if tag_end.is_some_and(|end| end > tag_start) {
-        return None;
-    }
-
-    let tag = &before[tag_start + 1..];
-
-    if tag.starts_with('/')
-        || tag.starts_with('!')
-        || tag.starts_with('?')
+    if before[tag_start + 1..].starts_with('/')
+        || before[tag_start + 1..].starts_with('!')
+        || before[tag_start + 1..].starts_with('?')
     {
         return None;
     }
 
+    let bytes = text.as_bytes();
+
+    // Ищем конец открывающего тега, учитывая кавычки.
+    let mut quote = None;
+    let mut tag_end = text.len();
+    let mut i = tag_start + 1;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                if quote == Some(bytes[i]) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(bytes[i]);
+                }
+            }
+            b'>' if quote.is_none() => {
+                tag_end = i;
+                break;
+            }
+            _ => {}
+        }
+
+        i += 1;
+    }
+
+    if cursor > tag_end {
+        return None;
+    }
+
+    let tag = &text[tag_start + 1..tag_end];
     let bytes = tag.as_bytes();
+
     let mut i = 0;
 
-    // Пропускаем имя HTML-тега.
+    // Пропускаем имя тега.
     while i < bytes.len()
         && !bytes[i].is_ascii_whitespace()
         && bytes[i] != b'/'
@@ -267,7 +297,12 @@ fn class_value_prefix(
                 i += 1;
             }
 
-        let name = &tag[name_start..i];
+        if i == name_start {
+            i += 1;
+            continue;
+        }
+
+        let is_class = tag[name_start..i].eq_ignore_ascii_case("class");
 
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
@@ -287,53 +322,65 @@ fn class_value_prefix(
             break;
         }
 
-        let is_class = name.eq_ignore_ascii_case("class");
+        let (value_start, value_end);
 
         if bytes[i] == b'"' || bytes[i] == b'\'' {
             let quote = bytes[i];
             i += 1;
 
-            let value_start = i;
+            value_start = i;
 
-            if let Some(close) = tag[i..].find(quote as char) {
-                i += close + 1;
-                continue;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
             }
 
-            if is_class {
-                let value = &tag[value_start..];
+            value_end = i;
 
-                let token_offset = value
-                    .rfind(char::is_whitespace)
-                    .map_or(0, |p| p + value[p..].chars().next().map_or(0, |c| c.len_utf8()));
-
-                return Some((
-                    tag_start + 1 + value_start + token_offset,
-                    &value[token_offset..],
-                ));
+            if i < bytes.len() {
+                i += 1;
             }
-
-            break;
         } else {
-            let value_start = i;
+            value_start = i;
 
             while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
 
-            if is_class {
-                let value = &tag[value_start..i];
-
-                let token_offset = value
-                    .rfind(char::is_whitespace)
-                    .map_or(0, |p| p + value[p..].chars().next().map_or(0, |c| c.len_utf8()));
-
-                return Some((
-                    tag_start + 1 + value_start + token_offset,
-                    &value[token_offset..],
-                ));
-            }
+            value_end = i;
         }
+
+        if !is_class {
+            continue;
+        }
+
+        // Курсор должен находиться именно внутри значения class.
+        if cursor < tag_start + 1 + value_start
+            || cursor > tag_start + 1 + value_end
+        {
+            return None;
+        }
+
+        let value = &tag[value_start..value_end];
+        let local_cursor = cursor - (tag_start + 1 + value_start);
+
+        // Находим начало текущего класса.
+        let token_start = value[..local_cursor]
+            .rfind(char::is_whitespace)
+            .map_or(0, |p| p + 1);
+
+        // Находим конец текущего класса.
+        let token_end = value[local_cursor..]
+            .find(char::is_whitespace)
+            .map_or(value.len(), |p| local_cursor + p);
+
+        let absolute_start = tag_start + 1 + value_start + token_start;
+        let absolute_end = tag_start + 1 + value_start + token_end;
+
+        return Some((
+            absolute_start,
+            absolute_end,
+            &value[token_start..local_cursor],
+        ));
     }
 
     None

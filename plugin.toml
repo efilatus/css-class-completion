@@ -2,7 +2,7 @@
 id = "efilatus.css-class-completion"
 name = "CSS Class Completion"
 version = "0.1.1"
-description = "HTML completion for CSS classes from project stylesheets."
+description = "Completion for CSS classes from project stylesheets."
 authors = []
 categories = ["tools"]
 engines.openidea = "^1.6"
@@ -13,4 +13,4 @@ required = ["project.read"]
 
 [[contributes.providers]]
 kinds = ["completion"]
-languages = ["html"]
+languages = ["html", "vue", "php", "twig", "javascript", "typescript", "svelte"]

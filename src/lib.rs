@@ -10,8 +10,35 @@ use openidea_plugin::text::{offset, position};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-const CACHE_TTL: Duration = Duration::from_secs(3);
+const CACHE_TTL: Duration = Duration::from_secs(15);
 const MAX_FILES: u32 = 200;
+/// Index hits to inspect per pattern. Higher than `MAX_FILES` so excluded
+/// directories do not consume the read quota.
+const FIND_LIMIT: u32 = 4_000;
+
+const COMPLETION_LANGUAGES: &[&str] = &[
+    "html",
+    "vue",
+    "php",
+    "twig",
+    "javascript",
+    "typescript",
+    "svelte",
+];
+
+const STYLESHEET_GLOBS: &[&str] = &[
+    "**/*.css",
+    "**/*.scss",
+    "**/*.less",
+    "**/*.module.css",
+    "**/*.module.scss",
+    "**/*.module.less",
+];
+
+const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".git", "target", "vendor"];
+
+const FRAMEWORK_DIRS: &[&str] = &["src", "public", "assets"];
+const FRAMEWORK_FILES: &[&str] = &["tailwind.css", "styles.css", "bootstrap.min.css"];
 
 #[derive(Default)]
 pub struct Main {
@@ -35,22 +62,32 @@ impl Main {
         }
 
         let mut classes = BTreeSet::new();
+        let mut seen = BTreeSet::new();
 
-        for extension in ["css", "scss", "less"] {
-            let pattern = format!("**/*.{extension}");
-
-            let Ok(files) = project.find_files(&pattern, MAX_FILES) else {
+        for pattern in STYLESHEET_GLOBS {
+            let Ok(files) = project.find_files(pattern, FIND_LIMIT) else {
                 continue;
             };
 
+            let mut kept = 0u32;
             for file in files {
+                if path_is_excluded(&file, &root) || !seen.insert(file.clone()) {
+                    continue;
+                }
+
                 let Ok(content) = project.read_file(&file) else {
                     continue;
                 };
 
                 extract_classes(&content, &mut classes);
+                kept += 1;
+                if kept >= MAX_FILES {
+                    break;
+                }
             }
         }
+
+        load_framework_classes(&project, &mut classes);
 
         let result: Vec<String> = classes.into_iter().collect();
 
@@ -71,7 +108,7 @@ impl Providers for Main {
         at: Position,
         _trigger: Option<&str>,
     ) -> Vec<CompletionItem> {
-        if doc.language != "html" {
+        if !completion_language(&doc.language) {
             return Vec::new();
         }
 
@@ -115,6 +152,36 @@ impl Plugin for Main {
 }
 
 register_plugin!(Main, providers);
+
+fn completion_language(language: &str) -> bool {
+    COMPLETION_LANGUAGES.contains(&language)
+}
+
+/// True when any path segment inside the project is a directory we refuse to scan.
+fn path_is_excluded(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches(['/', '\\']);
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .trim_start_matches(['/', '\\']);
+
+    relative
+        .split(['/', '\\'])
+        .any(|part| EXCLUDED_DIRS.contains(&part))
+}
+
+/// Reads a few well-known framework stylesheets directly, without walking `node_modules`.
+fn load_framework_classes(project: &host::Project, classes: &mut BTreeSet<String>) {
+    for dir in FRAMEWORK_DIRS {
+        for name in FRAMEWORK_FILES {
+            let path = format!("{dir}/{name}");
+            let Ok(content) = project.read_file(&path) else {
+                continue;
+            };
+            extract_classes(&content, classes);
+        }
+    }
+}
 
 /// Извлекает CSS-классы из селекторов.
 fn extract_classes(css: &str, output: &mut BTreeSet<String>) {
@@ -384,4 +451,79 @@ fn class_value_prefix(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_languages_cover_markup_and_script_hosts() {
+        for language in [
+            "html",
+            "vue",
+            "php",
+            "twig",
+            "javascript",
+            "typescript",
+            "svelte",
+        ] {
+            assert!(completion_language(language), "{language}");
+        }
+        assert!(!completion_language("css"));
+        assert!(!completion_language("HTML"));
+    }
+
+    #[test]
+    fn excluded_dirs_match_path_segments_inside_the_project_only() {
+        let root = "/work/target";
+        assert!(!path_is_excluded("/work/target/src/app.css", root));
+        assert!(!path_is_excluded(
+            "/work/target/src/Button.module.css",
+            root
+        ));
+        assert!(path_is_excluded(
+            "/work/target/node_modules/pkg/index.css",
+            root
+        ));
+        assert!(path_is_excluded("/work/target/dist/app.css", root));
+        assert!(path_is_excluded("/work/target/build/app.css", root));
+        assert!(path_is_excluded("/work/target/.git/x.css", root));
+        assert!(path_is_excluded("/work/target/target/app.css", root));
+        assert!(path_is_excluded("/work/target/vendor/lib.css", root));
+        assert!(path_is_excluded(
+            r"C:\work\app\node_modules\pkg\index.css",
+            r"C:\work\app"
+        ));
+        assert!(!path_is_excluded(
+            "/work/target/src/dist-utils/app.css",
+            root
+        ));
+    }
+
+    #[test]
+    fn extract_classes_reads_selectors_and_ignores_declaration_text() {
+        let mut classes = BTreeSet::new();
+        extract_classes(
+            r#"
+            .button, .button-primary { color: red; }
+            .card::before { content: ".not-a-class"; /* .inside-block */ }
+            "#,
+            &mut classes,
+        );
+        assert!(classes.contains("button"));
+        assert!(classes.contains("button-primary"));
+        assert!(classes.contains("card"));
+        assert!(!classes.contains("not-a-class"));
+        assert!(!classes.contains("inside-block"));
+    }
+
+    #[test]
+    fn class_value_prefix_still_returns_the_token_under_the_cursor() {
+        let text = r#"<div class="btn primary">"#;
+        let cursor = text.find("primary").unwrap() + "pri".len();
+        let (start, end, typed) = class_value_prefix(text, cursor).unwrap();
+        assert_eq!(typed, "pri");
+        assert_eq!(&text[start..end], "primary");
+    }
 }

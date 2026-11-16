@@ -1,7 +1,7 @@
 
 id = "efilatus.css-class-completion"
 name = "CSS Class Completion"
-version = "0.1.0"
+version = "0.1.1"
 description = "HTML completion for CSS classes from project stylesheets."
 authors = []
 categories = ["tools"]

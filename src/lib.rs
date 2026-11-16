@@ -427,27 +427,30 @@ fn class_value_prefix(
             return None;
         }
 
-        let value = &tag[value_start..value_end];
+        let value = tag.get(value_start..value_end)?;
         let local_cursor = cursor - (tag_start + 1 + value_start);
 
-        // Находим начало текущего класса.
-        let token_start = value[..local_cursor]
-            .rfind(char::is_whitespace)
-            .map_or(0, |p| p + 1);
+        let before_cursor = value.get(..local_cursor)?;
+        let after_cursor = value.get(local_cursor..)?;
 
-        // Находим конец текущего класса.
-        let token_end = value[local_cursor..]
+        // Начало класса: прыгаем на ПОЛНУЮ длину пробела (len_utf8), а не на 1 байт.
+        // Иначе на U+3000 / NBSP попадаем в середину символа и паникуем.
+        let token_start = before_cursor
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| c.is_whitespace())
+            .map_or(0, |(p, c)| p + c.len_utf8());
+
+        // Конец класса: find возвращает начало пробела — это уже граница символа.
+        let token_end = after_cursor
             .find(char::is_whitespace)
             .map_or(value.len(), |p| local_cursor + p);
 
         let absolute_start = tag_start + 1 + value_start + token_start;
         let absolute_end = tag_start + 1 + value_start + token_end;
 
-        return Some((
-            absolute_start,
-            absolute_end,
-            &value[token_start..local_cursor],
-        ));
+        let typed = value.get(token_start..local_cursor)?;
+        return Some((absolute_start, absolute_end, typed));
     }
 
     None
@@ -456,6 +459,8 @@ fn class_value_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== Тесты Cursor: языки, исключение папок, парсинг селекторов =====
 
     #[test]
     fn completion_languages_cover_markup_and_script_hosts() {
@@ -525,5 +530,34 @@ mod tests {
         let (start, end, typed) = class_value_prefix(text, cursor).unwrap();
         assert_eq!(typed, "pri");
         assert_eq!(&text[start..end], "primary");
+    }
+
+    // ===== Мои тесты: границы UTF-8 при разных пробелах (регрессия из репорта) =====
+
+    fn check_btn_token(text: &str, expect_token: &str) {
+        let cursor = text.find("btn").unwrap() + "btn".len();
+        let (s, e, typed) = class_value_prefix(text, cursor).unwrap();
+        assert_eq!(typed, "btn");
+        assert_eq!(&text[s..e], expect_token);
+    }
+
+    #[test]
+    fn ascii_space() {
+        check_btn_token(r#"<div class="other btn"></div>"#, "btn");
+    }
+
+    #[test]
+    fn ideographic_space_u3000() {
+        check_btn_token("<div class=\"other\u{3000}btn\"></div>", "btn");
+    }
+
+    #[test]
+    fn nbsp_u00a0() {
+        check_btn_token("<div class=\"other\u{00a0}btn\"></div>", "btn");
+    }
+
+    #[test]
+    fn mid_token_replacement() {
+        check_btn_token(r#"<div class="other btn-primary"></div>"#, "btn-primary");
     }
 }

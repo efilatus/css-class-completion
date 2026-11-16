@@ -10,8 +10,35 @@ use openidea_plugin::text::{offset, position};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-const CACHE_TTL: Duration = Duration::from_secs(3);
+const CACHE_TTL: Duration = Duration::from_secs(15);
 const MAX_FILES: u32 = 200;
+/// Index hits to inspect per pattern. Higher than `MAX_FILES` so excluded
+/// directories do not consume the read quota.
+const FIND_LIMIT: u32 = 4_000;
+
+const COMPLETION_LANGUAGES: &[&str] = &[
+    "html",
+    "vue",
+    "php",
+    "twig",
+    "javascript",
+    "typescript",
+    "svelte",
+];
+
+const STYLESHEET_GLOBS: &[&str] = &[
+    "**/*.css",
+    "**/*.scss",
+    "**/*.less",
+    "**/*.module.css",
+    "**/*.module.scss",
+    "**/*.module.less",
+];
+
+const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".git", "target", "vendor"];
+
+const FRAMEWORK_DIRS: &[&str] = &["src", "public", "assets"];
+const FRAMEWORK_FILES: &[&str] = &["tailwind.css", "styles.css", "bootstrap.min.css"];
 
 #[derive(Default)]
 pub struct Main {
@@ -35,22 +62,32 @@ impl Main {
         }
 
         let mut classes = BTreeSet::new();
+        let mut seen = BTreeSet::new();
 
-        for extension in ["css", "scss", "less"] {
-            let pattern = format!("**/*.{extension}");
-
-            let Ok(files) = project.find_files(&pattern, MAX_FILES) else {
+        for pattern in STYLESHEET_GLOBS {
+            let Ok(files) = project.find_files(pattern, FIND_LIMIT) else {
                 continue;
             };
 
+            let mut kept = 0u32;
             for file in files {
+                if path_is_excluded(&file, &root) || !seen.insert(file.clone()) {
+                    continue;
+                }
+
                 let Ok(content) = project.read_file(&file) else {
                     continue;
                 };
 
                 extract_classes(&content, &mut classes);
+                kept += 1;
+                if kept >= MAX_FILES {
+                    break;
+                }
             }
         }
+
+        load_framework_classes(&project, &mut classes);
 
         let result: Vec<String> = classes.into_iter().collect();
 
@@ -71,7 +108,7 @@ impl Providers for Main {
         at: Position,
         _trigger: Option<&str>,
     ) -> Vec<CompletionItem> {
-        if doc.language != "html" {
+        if !completion_language(&doc.language) {
             return Vec::new();
         }
 
@@ -115,6 +152,36 @@ impl Plugin for Main {
 }
 
 register_plugin!(Main, providers);
+
+fn completion_language(language: &str) -> bool {
+    COMPLETION_LANGUAGES.contains(&language)
+}
+
+/// True when any path segment inside the project is a directory we refuse to scan.
+fn path_is_excluded(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches(['/', '\\']);
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .trim_start_matches(['/', '\\']);
+
+    relative
+        .split(['/', '\\'])
+        .any(|part| EXCLUDED_DIRS.contains(&part))
+}
+
+/// Reads a few well-known framework stylesheets directly, without walking `node_modules`.
+fn load_framework_classes(project: &host::Project, classes: &mut BTreeSet<String>) {
+    for dir in FRAMEWORK_DIRS {
+        for name in FRAMEWORK_FILES {
+            let path = format!("{dir}/{name}");
+            let Ok(content) = project.read_file(&path) else {
+                continue;
+            };
+            extract_classes(&content, classes);
+        }
+    }
+}
 
 /// Извлекает CSS-классы из селекторов.
 fn extract_classes(css: &str, output: &mut BTreeSet<String>) {
@@ -360,28 +427,137 @@ fn class_value_prefix(
             return None;
         }
 
-        let value = &tag[value_start..value_end];
+        let value = tag.get(value_start..value_end)?;
         let local_cursor = cursor - (tag_start + 1 + value_start);
 
-        // Находим начало текущего класса.
-        let token_start = value[..local_cursor]
-            .rfind(char::is_whitespace)
-            .map_or(0, |p| p + 1);
+        let before_cursor = value.get(..local_cursor)?;
+        let after_cursor = value.get(local_cursor..)?;
 
-        // Находим конец текущего класса.
-        let token_end = value[local_cursor..]
+        // Начало класса: прыгаем на ПОЛНУЮ длину пробела (len_utf8), а не на 1 байт.
+        // Иначе на U+3000 / NBSP попадаем в середину символа и паникуем.
+        let token_start = before_cursor
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| c.is_whitespace())
+            .map_or(0, |(p, c)| p + c.len_utf8());
+
+        // Конец класса: find возвращает начало пробела — это уже граница символа.
+        let token_end = after_cursor
             .find(char::is_whitespace)
             .map_or(value.len(), |p| local_cursor + p);
 
         let absolute_start = tag_start + 1 + value_start + token_start;
         let absolute_end = tag_start + 1 + value_start + token_end;
 
-        return Some((
-            absolute_start,
-            absolute_end,
-            &value[token_start..local_cursor],
-        ));
+        let typed = value.get(token_start..local_cursor)?;
+        return Some((absolute_start, absolute_end, typed));
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===== Тесты Cursor: языки, исключение папок, парсинг селекторов =====
+
+    #[test]
+    fn completion_languages_cover_markup_and_script_hosts() {
+        for language in [
+            "html",
+            "vue",
+            "php",
+            "twig",
+            "javascript",
+            "typescript",
+            "svelte",
+        ] {
+            assert!(completion_language(language), "{language}");
+        }
+        assert!(!completion_language("css"));
+        assert!(!completion_language("HTML"));
+    }
+
+    #[test]
+    fn excluded_dirs_match_path_segments_inside_the_project_only() {
+        let root = "/work/target";
+        assert!(!path_is_excluded("/work/target/src/app.css", root));
+        assert!(!path_is_excluded(
+            "/work/target/src/Button.module.css",
+            root
+        ));
+        assert!(path_is_excluded(
+            "/work/target/node_modules/pkg/index.css",
+            root
+        ));
+        assert!(path_is_excluded("/work/target/dist/app.css", root));
+        assert!(path_is_excluded("/work/target/build/app.css", root));
+        assert!(path_is_excluded("/work/target/.git/x.css", root));
+        assert!(path_is_excluded("/work/target/target/app.css", root));
+        assert!(path_is_excluded("/work/target/vendor/lib.css", root));
+        assert!(path_is_excluded(
+            r"C:\work\app\node_modules\pkg\index.css",
+            r"C:\work\app"
+        ));
+        assert!(!path_is_excluded(
+            "/work/target/src/dist-utils/app.css",
+            root
+        ));
+    }
+
+    #[test]
+    fn extract_classes_reads_selectors_and_ignores_declaration_text() {
+        let mut classes = BTreeSet::new();
+        extract_classes(
+            r#"
+            .button, .button-primary { color: red; }
+            .card::before { content: ".not-a-class"; /* .inside-block */ }
+            "#,
+            &mut classes,
+        );
+        assert!(classes.contains("button"));
+        assert!(classes.contains("button-primary"));
+        assert!(classes.contains("card"));
+        assert!(!classes.contains("not-a-class"));
+        assert!(!classes.contains("inside-block"));
+    }
+
+    #[test]
+    fn class_value_prefix_still_returns_the_token_under_the_cursor() {
+        let text = r#"<div class="btn primary">"#;
+        let cursor = text.find("primary").unwrap() + "pri".len();
+        let (start, end, typed) = class_value_prefix(text, cursor).unwrap();
+        assert_eq!(typed, "pri");
+        assert_eq!(&text[start..end], "primary");
+    }
+
+    // ===== Мои тесты: границы UTF-8 при разных пробелах (регрессия из репорта) =====
+
+    fn check_btn_token(text: &str, expect_token: &str) {
+        let cursor = text.find("btn").unwrap() + "btn".len();
+        let (s, e, typed) = class_value_prefix(text, cursor).unwrap();
+        assert_eq!(typed, "btn");
+        assert_eq!(&text[s..e], expect_token);
+    }
+
+    #[test]
+    fn ascii_space() {
+        check_btn_token(r#"<div class="other btn"></div>"#, "btn");
+    }
+
+    #[test]
+    fn ideographic_space_u3000() {
+        check_btn_token("<div class=\"other\u{3000}btn\"></div>", "btn");
+    }
+
+    #[test]
+    fn nbsp_u00a0() {
+        check_btn_token("<div class=\"other\u{00a0}btn\"></div>", "btn");
+    }
+
+    #[test]
+    fn mid_token_replacement() {
+        check_btn_token(r#"<div class="other btn-primary"></div>"#, "btn-primary");
+    }
 }

@@ -1,20 +1,26 @@
 # CSS Class Completion
 
-An [OpenIDEA](https://github.com/l0ng-ai/openidea) plugin that provides CSS class name completion in HTML documents.
+An OpenIDEA plugin that provides CSS class name completion from your project stylesheets.
 
 ## Features
 
-- **CSS class completion** — suggests class names while typing inside HTML `class` attributes.
-- **Multiple stylesheet formats** — extracts class names from `.css`, `.scss`, and `.less` files.
+- **CSS class completion** — suggests class names while typing inside `class` attributes.
+- **Multiple languages** — works in HTML, Vue, PHP, Twig, JavaScript, TypeScript, and Svelte documents.
+- **Multiple stylesheet formats** — extracts class names from `.css`, `.scss`, and `.less` files, including CSS Modules (`*.module.css` / `*.module.scss` / `*.module.less`).
 - **Prefix matching** — filters suggestions based on the text already entered.
+- **Smart token replacement** — replaces the whole class name under the cursor, even when editing in the middle of a token.
 - **Multiple attribute formats** — supports single-quoted, double-quoted, and unquoted `class` values.
-- **Lightweight caching** — caches discovered class names for 3 seconds to reduce repeated file scanning.
+- **Unicode-safe** — handles non-ASCII whitespace (e.g. NBSP, U+3000) as class separators without panics.
+- **Lightweight caching** — caches discovered class names for 15 seconds to reduce repeated file scanning.
 
 ## How It Works
 
 The plugin searches the current project for CSS, SCSS, and LESS files, extracts class names from their selectors, and offers matching names through the OpenIDEA completion provider.
 
-It scans up to 200 files per stylesheet format and returns up to 500 matching suggestions.
+- Scans up to **200 files per glob pattern** and returns up to **500 matching suggestions**.
+- Skips `node_modules`, `dist`, `build`, `.git`, `target`, and `vendor` directories.
+- Additionally reads well-known framework stylesheets (`tailwind.css`, `styles.css`, `bootstrap.min.css`) directly from `src/`, `public/`, and `assets/`.
+- The selector parser ignores comments and string literals, so text like `content: ".not-a-class"` never pollutes suggestions.
 
 ## Requirements
 
@@ -43,10 +49,11 @@ This loads the plugin folder in OpenIDEA. You can manage linked plugins in **Set
 
 ## Limitations
 
-- Completion is available in HTML documents only.
-- Class names are extracted from stylesheet selectors using a lightweight parser, not a full CSS parser.
+- Completion triggers inside `class` attributes only — JSX `className`, Vue `:class` bindings, and `classList.add()` calls are not supported yet.
+- Class names are extracted using a lightweight parser, not a full CSS parser: SCSS nesting with `&` (e.g. BEM `&__element`) is not expanded into full class names.
+- Tailwind utility classes are only suggested if they exist in a stylesheet — they are not generated on the fly.
 - Dynamically generated class names from JavaScript or template expressions are not discovered.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the MIT License.

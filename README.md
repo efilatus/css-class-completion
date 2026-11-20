@@ -2,12 +2,12 @@
 
 An OpenIDEA plugin that provides CSS class name completion from your project stylesheets.
 
-Version 0.2.0.
+Version 0.2.1.
 
 ## Features
 
 - **CSS class completion** — suggests class names while typing inside `class` attributes.
-- **Recent selections first** — the last 5 classes you picked from completion stay on top, per project, persisted across restarts.
+- **Recent usage first** — classes you picked most often in your last 20 selections rank on top, per project, persisted across restarts.
 - **Multiple languages** — works in HTML, Vue, PHP, Twig, JavaScript, TypeScript, and Svelte documents.
 - **Multiple stylesheet formats** — extracts class names from `.css`, `.scss`, and `.less` files, including CSS Modules (`*.module.css` / `*.module.scss` / `*.module.less`).
 - **Prefix matching** — filters suggestions based on the text already entered.

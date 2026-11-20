@@ -1,6 +1,6 @@
 
 use openidea_plugin::{
-    DocumentChanged, Error, Event, Invocation, Plugin, Position, Range, host, register_plugin,
+    DocumentChanged, Error, Event, Invocation, LogLevel, Plugin, Position, Range, host, register_plugin,
 };
 use openidea_plugin::providers::{
     CompletionItem, CompletionKind, Document, Providers,
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const CACHE_TTL: Duration = Duration::from_secs(15);
 const MAX_FILES: u32 = 200;
 const MAX_ITEMS: usize = 500;
-const MRU_SIZE: usize = 5;
+const HISTORY_SIZE: usize = 20;
 const OFFER_TTL_SECS: u64 = 10;
 const MAX_PENDING_OFFERS: usize = 16;
 const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
@@ -63,8 +63,8 @@ struct Offer {
 #[derive(Default)]
 pub struct Main {
     cache: Option<(String, Instant, Vec<String>)>,
-    /// Project root → recent classes, index 0 is the newest. Loaded on first use.
-    mru: HashMap<String, Vec<String>>,
+    /// Project root → last selections, index 0 is the newest. Duplicates count. Loaded on first use.
+    history: HashMap<String, Vec<String>>,
     offers: HashMap<String, Offer>,
     next_offer: u64,
 }
@@ -153,19 +153,20 @@ impl Providers for Main {
 
         let matched: Vec<String> = classes.into_iter().filter(|name| name.starts_with(typed)).collect();
         let root = host::project_of(&doc.path).and_then(|project| project.root().ok());
-        let mru = match root.as_deref() {
-            Some(root) => self.ensure_mru(root).cloned().unwrap_or_default(),
+        let history = match root.as_deref() {
+            Some(root) => self.ensure_history(root).cloned().unwrap_or_default(),
             None => Vec::new(),
         };
-        let items: Vec<CompletionItem> = rank_matches(&matched, &mru)
+        let items: Vec<CompletionItem> = rank(&matched, &history)
             .into_iter()
             .take(MAX_ITEMS)
             .enumerate()
             .map(|(index, name)| {
-                let detail = if mru.iter().any(|recent| recent == &name) {
-                    "CSS class · recently used"
+                let times = history.iter().filter(|entry| *entry == &name).count();
+                let detail = if times > 0 {
+                    format!("CSS class · {times}× in last 20")
                 } else {
-                    "CSS class"
+                    "CSS class".to_string()
                 };
                 CompletionItem {
                     replace: Some(replace),
@@ -197,7 +198,7 @@ impl Providers for Main {
 
 impl Plugin for Main {
     fn activate(&mut self, _ctx: &openidea_plugin::Context) -> Result<(), Error> {
-        host::subscribe_paths(
+        if let Err(error) = host::subscribe_paths(
             "document-changed",
             &[
                 "**/*.html",
@@ -210,7 +211,14 @@ impl Plugin for Main {
                 "**/*.tsx",
                 "**/*.svelte",
             ],
-        )
+        ) {
+            host::log(
+                LogLevel::Error,
+                &format!("css-class-completion: document-changed subscription failed: {error}"),
+            );
+        }
+        purge_legacy_mru();
+        Ok(())
     }
 
     fn run_command(
@@ -235,19 +243,19 @@ impl Plugin for Main {
 register_plugin!(Main, providers);
 
 impl Main {
-    /// Loads this project's MRU on first use. `None` when storage cannot be read,
+    /// Loads this project's history on first use. `None` when storage cannot be read,
     /// so a later save does not overwrite data we failed to load.
-    fn ensure_mru(&mut self, root: &str) -> Option<&mut Vec<String>> {
+    fn ensure_history(&mut self, root: &str) -> Option<&mut Vec<String>> {
         let root = normalize_root(root);
-        if !self.mru.contains_key(&root) {
-            let loaded = match host::storage::get(&mru_key(&root)) {
-                Ok(Some(raw)) => parse_mru(&raw),
+        if !self.history.contains_key(&root) {
+            let loaded = match host::storage::get(&history_key(&root)) {
+                Ok(Some(raw)) => parse_history(&raw),
                 Ok(None) => Vec::new(),
                 Err(_) => return None,
             };
-            self.mru.insert(root.clone(), loaded);
+            self.history.insert(root.clone(), loaded);
         }
-        self.mru.get_mut(&root)
+        self.history.get_mut(&root)
     }
 
     fn remember_offer(&mut self, path: String, mut offer: Offer) {
@@ -309,14 +317,14 @@ impl Main {
         if picked.is_empty() {
             return;
         }
-        let Some(mru) = self.ensure_mru(&root) else {
+        let Some(history) = self.ensure_history(&root) else {
             return;
         };
         for class in &picked {
-            mru_update(mru, class);
+            history_push(history, class);
         }
-        let saved = mru.clone();
-        save_mru(&root, &saved);
+        let saved = history.clone();
+        save_history(&root, &saved);
     }
 }
 
@@ -623,16 +631,17 @@ fn class_value_prefix(
     None
 }
 
-fn mru_update(mru: &mut Vec<String>, class: &str) {
-    mru.retain(|existing| existing != class);
-    mru.insert(0, class.to_string());
-    mru.truncate(MRU_SIZE);
+fn history_push(history: &mut Vec<String>, class: &str) {
+    history.insert(0, class.to_string());
+    history.truncate(HISTORY_SIZE);
 }
 
-/// MRU hits first (newest first), then the remaining names in their current order.
-fn rank_matches(candidates: &[String], mru: &[String]) -> Vec<String> {
-    let mut ranked: Vec<String> = mru.iter().filter(|class| candidates.contains(*class)).cloned().collect();
-    ranked.extend(candidates.iter().filter(|class| !mru.contains(*class)).cloned());
+/// Higher count first. Equal counts: the newer history entry wins. Unseen names stay alphabetical.
+fn rank(candidates: &[String], history: &[String]) -> Vec<String> {
+    let count = |class: &String| history.iter().filter(|entry| *entry == class).count();
+    let first = |class: &String| history.iter().position(|entry| entry == class).unwrap_or(usize::MAX);
+    let mut ranked = candidates.to_vec();
+    ranked.sort_by(|a, b| count(b).cmp(&count(a)).then(first(a).cmp(&first(b))).then(a.cmp(b)));
     ranked
 }
 
@@ -674,27 +683,36 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn mru_key(root: &str) -> String {
-    format!("mru:v1:{:016x}", fnv1a64(normalize_root(root).as_bytes()))
+fn history_key(root: &str) -> String {
+    format!("hist:v1:{:016x}", fnv1a64(normalize_root(root).as_bytes()))
 }
 
-fn serialize_mru(mru: &[String]) -> String {
-    mru.iter().take(MRU_SIZE).cloned().collect::<Vec<_>>().join("\n")
+fn serialize_history(history: &[String]) -> String {
+    history.iter().take(HISTORY_SIZE).cloned().collect::<Vec<_>>().join("\n")
 }
 
-fn parse_mru(raw: &str) -> Vec<String> {
+fn parse_history(raw: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in raw.split(['\n', '\r']) {
         let name = line.trim();
-        if !valid_class_name(name) || names.iter().any(|existing| existing == name) {
+        if !valid_class_name(name) {
             continue;
         }
         names.push(name.to_string());
-        if names.len() == MRU_SIZE {
+        if names.len() == HISTORY_SIZE {
             break;
         }
     }
     names
+}
+
+fn purge_legacy_mru() {
+    let Ok(keys) = host::storage::keys("mru:v1:") else {
+        return;
+    };
+    for key in keys {
+        let _ = host::storage::delete(&key);
+    }
 }
 
 fn valid_class_name(name: &str) -> bool {
@@ -708,8 +726,8 @@ fn valid_class_name(name: &str) -> bool {
     chars.all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
 }
 
-fn save_mru(root: &str, mru: &[String]) {
-    let _ = host::storage::set(&mru_key(root), &serialize_mru(mru));
+fn save_history(root: &str, history: &[String]) {
+    let _ = host::storage::set(&history_key(root), &serialize_history(history));
 }
 
 fn now_unix() -> u64 {
@@ -867,43 +885,86 @@ mod tests {
         items.iter().map(|name| (*name).to_string()).collect()
     }
 
-    fn sample_mru() -> Vec<String> {
-        names(&["box__blue", "btn", "container", "card", "text-muted"])
+    /// Newest first: box__blue ×12, btn ×4, card ×2, container ×1, box__white ×1.
+    fn reference_history() -> Vec<String> {
+        let mut history = Vec::new();
+        for _ in 0..12 {
+            history.push("box__blue".into());
+        }
+        for _ in 0..4 {
+            history.push("btn".into());
+        }
+        for _ in 0..2 {
+            history.push("card".into());
+        }
+        history.push("container".into());
+        history.push("box__white".into());
+        history
     }
 
     #[test]
-    fn rank_puts_recent_prefix_matches_first_without_hiding_the_rest() {
-        let mru = sample_mru();
+    fn rank_orders_by_count_then_recency_then_alphabet() {
+        let history = reference_history();
+        assert_eq!(history.len(), 20);
         assert_eq!(
-            rank_matches(&names(&["box", "box__blue", "box__border"]), &mru),
-            names(&["box__blue", "box", "box__border"])
+            rank(&names(&["box", "box__blue", "box__border", "box__white"]), &history),
+            names(&["box__blue", "box__white", "box", "box__border"])
         );
         assert_eq!(
-            rank_matches(&names(&["badge", "banner", "box", "box__blue", "box__border", "btn", "button"]), &mru),
-            names(&["box__blue", "btn", "badge", "banner", "box", "box__border", "button"])
-        );
-        assert_eq!(rank_matches(&names(&["xyz", "xyz-a"]), &mru), names(&["xyz", "xyz-a"]));
-        assert_eq!(
-            rank_matches(
-                &names(&["badge", "box", "box__blue", "btn", "card", "container", "text-muted", "zebra"]),
-                &mru
+            rank(
+                &names(&["badge", "box", "box__blue", "box__border", "box__white", "btn", "card", "container"]),
+                &history
             ),
-            names(&["box__blue", "btn", "container", "card", "text-muted", "badge", "box", "zebra"])
+            names(&["box__blue", "btn", "card", "container", "box__white", "badge", "box", "box__border"])
         );
+        assert_eq!(rank(&names(&["b", "a", "c"]), &names(&["zzz"])), names(&["a", "b", "c"]));
+
+        let tied = names(&["fresh", "older", "fresh", "older", "fresh", "older"]);
+        assert_eq!(rank(&names(&["older", "fresh", "zzz"]), &tied), names(&["fresh", "older", "zzz"]));
+
         assert_eq!(
-            rank_matches(&names(&["box", "card"]), &names(&["gone", "box"])),
-            names(&["box", "card"])
+            rank(&names(&["aaa", "box", "box__blue", "box__white", "legacy"]), &history),
+            names(&["box__blue", "box__white", "aaa", "box", "legacy"])
         );
     }
 
     #[test]
-    fn mru_update_moves_repeat_to_front_and_drops_the_oldest() {
-        let mut mru = sample_mru();
-        mru_update(&mut mru, "btn");
-        assert_eq!(mru, names(&["btn", "box__blue", "container", "card", "text-muted"]));
-        mru_update(&mut mru, "badge");
-        assert_eq!(mru, names(&["badge", "btn", "box__blue", "container", "card"]));
-        assert!(!mru.contains(&"text-muted".to_string()));
+    fn one_more_white_does_not_pass_twelve_blues() {
+        let mut history = Vec::new();
+        history.push("box__white".into());
+        for _ in 0..11 {
+            history.push("box__blue".into());
+        }
+        for _ in 0..4 {
+            history.push("btn".into());
+        }
+        for _ in 0..2 {
+            history.push("card".into());
+        }
+        history.push("container".into());
+        history.push("box__blue".into());
+        assert_eq!(history.len(), 20);
+        history_push(&mut history, "box__white");
+        assert_eq!(history[0], "box__white");
+        assert_eq!(history.len(), 20);
+        assert_eq!(history.iter().filter(|entry| *entry == "box__blue").count(), 11);
+        assert_eq!(history.iter().filter(|entry| *entry == "box__white").count(), 2);
+        assert_eq!(
+            rank(&names(&["box", "box__blue", "box__border", "box__white"]), &history)[0],
+            "box__blue"
+        );
+    }
+
+    #[test]
+    fn history_push_keeps_duplicates_and_truncates_to_twenty() {
+        let mut history = Vec::new();
+        for index in 0..25 {
+            history_push(&mut history, if index % 2 == 0 { "box__blue" } else { "btn" });
+        }
+        assert_eq!(history.len(), 20);
+        assert_eq!(history[0], "box__blue");
+        assert!(history.iter().filter(|entry| *entry == "box__blue").count() > 1);
+        assert!(history.iter().filter(|entry| *entry == "btn").count() > 1);
     }
 
     fn offer(labels: &[&str], created_unix: u64) -> Offer {
@@ -944,17 +1005,20 @@ mod tests {
     }
 
     #[test]
-    fn mru_storage_roundtrip_skips_broken_lines_and_keeps_five() {
-        let names = names(&["box__blue", "btn", "container", "card", "text-muted"]);
-        assert_eq!(parse_mru(&serialize_mru(&names)), names);
+    fn history_storage_roundtrip_keeps_duplicates_and_truncates() {
+        let history = reference_history();
+        assert_eq!(parse_history(&serialize_history(&history)), history);
         assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
         assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
         assert_eq!(
-            parse_mru("box__blue\n\n   \nnot a class\n!!!\nbtn\ncontainer\ncard\ntext-muted\nextra\n"),
-            names
+            parse_history("box__blue\nbox__blue\n\n   \nnot a class\n!!!\nbtn\n"),
+            names(&["box__blue", "box__blue", "btn"])
         );
-        assert!(mru_key("/project").starts_with("mru:v1:"));
-        assert_ne!(mru_key("/project"), mru_key("/other"));
+        let mut long = serialize_history(&history);
+        long.push_str("\nextra\n");
+        assert_eq!(parse_history(&long), history);
+        assert!(history_key("/project").starts_with("hist:v1:"));
+        assert_ne!(history_key("/project"), history_key("/other"));
     }
 
     #[test]
@@ -1027,7 +1091,7 @@ mod tests {
             })],
             &mock.invocation(),
         );
-        assert_eq!(mock.storage().get(&mru_key("/project")).map(String::as_str), Some("box__blue"));
+        assert_eq!(mock.storage().get(&history_key("/project")).map(String::as_str), Some("box__blue"));
 
         plugin.handle_events(
             &[Event::DocumentChanged(DocumentChanged {
@@ -1042,7 +1106,7 @@ mod tests {
             })],
             &mock.invocation(),
         );
-        assert_eq!(mock.storage().get(&mru_key("/project")).map(String::as_str), Some("box__blue"));
+        assert_eq!(mock.storage().get(&history_key("/project")).map(String::as_str), Some("box__blue"));
 
         plugin.remember_offer(
             "/project/index.html".into(),
@@ -1068,7 +1132,7 @@ mod tests {
             &mock.invocation(),
         );
         assert_eq!(
-            mock.storage().get(&mru_key("/project")).map(String::as_str),
+            mock.storage().get(&history_key("/project")).map(String::as_str),
             Some("box__blue"),
             "an offer older than 10s does not count"
         );
@@ -1079,13 +1143,13 @@ mod tests {
             again.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
             ["box__blue", "box", "box__border"]
         );
-        assert_eq!(again[0].detail.as_deref(), Some("CSS class · recently used"));
+        assert_eq!(again[0].detail.as_deref(), Some("CSS class · 1× in last 20"));
         assert_eq!(again[1].detail.as_deref(), Some("CSS class"));
         assert!(again.iter().all(|item| item.label != "btn"));
     }
 
     #[test]
-    fn two_projects_store_independent_mru_lists() {
+    fn two_projects_store_independent_histories() {
         let mock = openidea_plugin::mock::MockHost::install();
         mock.set_project_root(Some("/proj-a"));
         mock.add_project("/proj-b");
@@ -1097,8 +1161,38 @@ mod tests {
         mock.set_project_root(Some("/proj-b"));
         select_class(&mock, &mut plugin, "/proj-b/page.html", "btn");
 
-        assert_eq!(mock.storage().get(&mru_key("/proj-a")).map(String::as_str), Some("box__blue"));
-        assert_eq!(mock.storage().get(&mru_key("/proj-b")).map(String::as_str), Some("btn"));
+        assert_eq!(mock.storage().get(&history_key("/proj-a")).map(String::as_str), Some("box__blue"));
+        assert_eq!(mock.storage().get(&history_key("/proj-b")).map(String::as_str), Some("btn"));
+    }
+
+    #[test]
+    fn activate_survives_a_denied_subscription_and_drops_old_mru_keys() {
+        let mock = openidea_plugin::mock::MockHost::install();
+        openidea_plugin::host::storage::set("mru:v1:dead", "box__blue").unwrap();
+        let mut plugin = Main::default();
+        plugin.activate(&openidea_plugin::Context::default()).unwrap();
+        assert!(!mock.storage().keys().any(|key| key.starts_with("mru:v1:")));
+
+        let limited = openidea_plugin::mock::MockHost::install()
+            .with_capabilities(&["project.read", "editor.read"]);
+        limited.add_file("src/app.css", ".b { } .a { }");
+        let mut plugin = Main::default();
+        assert!(plugin.activate(&openidea_plugin::Context::default()).is_ok());
+        assert!(limited.logs().iter().any(|(_, message)| message.contains("document-changed")));
+        let text = r#"<div class="">"#;
+        let doc = Document {
+            path: "/project/index.html".into(),
+            language: "html".into(),
+            version: 1,
+            text: text.into(),
+        };
+        let cursor = text.find("\"\"").unwrap() + 1;
+        let items = plugin.completion(&doc, position(text, cursor), None);
+        assert_eq!(
+            items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(items.iter().all(|item| item.detail.as_deref() == Some("CSS class")));
     }
 
     fn select_class(mock: &openidea_plugin::mock::MockHost, plugin: &mut Main, path: &str, class: &str) {

@@ -1,17 +1,23 @@
 
 use openidea_plugin::{
-    Error, Invocation, Plugin, Position, Range, host, register_plugin,
+    DocumentChanged, Error, Event, Invocation, Plugin, Position, Range, host, register_plugin,
 };
 use openidea_plugin::providers::{
     CompletionItem, CompletionKind, Document, Providers,
 };
-use openidea_plugin::text::{offset, position};
+use openidea_plugin::text::{offset, position, position_utf16};
 
-use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(15);
 const MAX_FILES: u32 = 200;
+const MAX_ITEMS: usize = 500;
+const MRU_SIZE: usize = 5;
+const OFFER_TTL_SECS: u64 = 10;
+const MAX_PENDING_OFFERS: usize = 16;
+const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x100000001b3;
 /// Index hits to inspect per pattern. Higher than `MAX_FILES` so excluded
 /// directories do not consume the read quota.
 const FIND_LIMIT: u32 = 4_000;
@@ -40,9 +46,27 @@ const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".git", "targe
 const FRAMEWORK_DIRS: &[&str] = &["src", "public", "assets"];
 const FRAMEWORK_FILES: &[&str] = &["tailwind.css", "styles.css", "bootstrap.min.css"];
 
+#[derive(Clone)]
+struct Offer {
+    labels: Vec<String>,
+    /// Snapshot of the completion that produced this offer. Matching uses the
+    /// inserted text, not these fields.
+    #[allow(dead_code)]
+    replace: Range,
+    #[allow(dead_code)]
+    version: u64,
+    created_unix: u64,
+    /// Insertion order, so same-second offers still evict oldest-first.
+    seq: u64,
+}
+
 #[derive(Default)]
 pub struct Main {
     cache: Option<(String, Instant, Vec<String>)>,
+    /// Project root → recent classes, index 0 is the newest. Loaded on first use.
+    mru: HashMap<String, Vec<String>>,
+    offers: HashMap<String, Offer>,
+    next_offer: u64,
 }
 
 impl Main {
@@ -127,20 +151,68 @@ impl Providers for Main {
             position(&doc.text, end),
         );
 
-        classes
-        .into_iter()
-        .filter(|name| name.starts_with(typed))
-        .take(500)
-        .map(|name| CompletionItem {
-            replace: Some(replace),
-            detail: Some("CSS class".into()),
-            ..CompletionItem::new(&name, CompletionKind::Reference)
-        })
-        .collect()
+        let matched: Vec<String> = classes.into_iter().filter(|name| name.starts_with(typed)).collect();
+        let root = host::project_of(&doc.path).and_then(|project| project.root().ok());
+        let mru = match root.as_deref() {
+            Some(root) => self.ensure_mru(root).cloned().unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let items: Vec<CompletionItem> = rank_matches(&matched, &mru)
+            .into_iter()
+            .take(MAX_ITEMS)
+            .enumerate()
+            .map(|(index, name)| {
+                let detail = if mru.iter().any(|recent| recent == &name) {
+                    "CSS class · recently used"
+                } else {
+                    "CSS class"
+                };
+                CompletionItem {
+                    replace: Some(replace),
+                    detail: Some(detail.to_string()),
+                    sort_text: Some(format!("{index:04}")),
+                    ..CompletionItem::new(&name, CompletionKind::Reference)
+                }
+            })
+            .collect();
+
+        let labels = items.iter().map(|item| item.label.clone()).collect();
+        let key = match root.as_deref() {
+            Some(root) => offer_key(&doc.path, root),
+            None => normalize_path(&doc.path),
+        };
+        self.remember_offer(
+            key,
+            Offer {
+                labels,
+                replace,
+                version: doc.version,
+                created_unix: now_unix(),
+                seq: 0,
+            },
+        );
+        items
     }
 }
 
 impl Plugin for Main {
+    fn activate(&mut self, _ctx: &openidea_plugin::Context) -> Result<(), Error> {
+        host::subscribe_paths(
+            "document-changed",
+            &[
+                "**/*.html",
+                "**/*.vue",
+                "**/*.php",
+                "**/*.twig",
+                "**/*.js",
+                "**/*.jsx",
+                "**/*.ts",
+                "**/*.tsx",
+                "**/*.svelte",
+            ],
+        )
+    }
+
     fn run_command(
         &mut self,
         id: &str,
@@ -149,9 +221,104 @@ impl Plugin for Main {
     ) -> Result<Option<String>, Error> {
         Err(format!("unknown command {id}").into())
     }
+
+    fn handle_events(&mut self, events: &[Event], ctx: &Invocation) {
+        for event in events {
+            let Event::DocumentChanged(change) = event else {
+                continue;
+            };
+            self.note_selection(change, ctx);
+        }
+    }
 }
 
 register_plugin!(Main, providers);
+
+impl Main {
+    /// Loads this project's MRU on first use. `None` when storage cannot be read,
+    /// so a later save does not overwrite data we failed to load.
+    fn ensure_mru(&mut self, root: &str) -> Option<&mut Vec<String>> {
+        let root = normalize_root(root);
+        if !self.mru.contains_key(&root) {
+            let loaded = match host::storage::get(&mru_key(&root)) {
+                Ok(Some(raw)) => parse_mru(&raw),
+                Ok(None) => Vec::new(),
+                Err(_) => return None,
+            };
+            self.mru.insert(root.clone(), loaded);
+        }
+        self.mru.get_mut(&root)
+    }
+
+    fn remember_offer(&mut self, path: String, mut offer: Offer) {
+        self.next_offer = self.next_offer.saturating_add(1);
+        offer.seq = self.next_offer;
+        self.offers.insert(path, offer);
+        while self.offers.len() > MAX_PENDING_OFFERS {
+            let oldest = self.offers.iter().min_by_key(|(_, offer)| offer.seq).map(|(path, _)| path.clone());
+            let Some(oldest) = oldest else { break };
+            self.offers.remove(&oldest);
+        }
+    }
+
+    fn find_offer(&self, path: &str, ctx: &Invocation) -> Option<Offer> {
+        if let Some(offer) = self.offers.get(path).cloned() {
+            return Some(offer);
+        }
+        let normalized = normalize_path(path);
+        if let Some(offer) = self.offers.get(&normalized).cloned() {
+            return Some(offer);
+        }
+        let root = resolve_root(path, ctx)?;
+        self.offers.get(&offer_key(path, &root)).cloned()
+    }
+
+    fn note_selection(&mut self, change: &DocumentChanged, ctx: &Invocation) {
+        let Some(offer) = self.find_offer(&change.path, ctx) else {
+            return;
+        };
+        let now = now_unix();
+        if !offer_is_fresh(&offer, now) {
+            return;
+        }
+        if !change.changes.iter().any(|edit| label_eq(&offer, &edit.insert)) {
+            return;
+        }
+        let Some(root) = resolve_root(&change.path, ctx) else {
+            return;
+        };
+        let Some(doc) = read_document(&change.path, ctx) else {
+            return;
+        };
+
+        let mut shift = 0i64;
+        let mut picked = Vec::new();
+        for edit in &change.changes {
+            let deleted = if edit.from <= edit.to { edit.to - edit.from } else { 0 };
+            let end = if edit.from <= edit.to {
+                insertion_end_byte(&doc.text, edit.from, &edit.insert, shift)
+            } else {
+                None
+            };
+            shift += i64::from(utf16_len(&edit.insert)) - i64::from(deleted);
+            let Some(byte) = end else { continue };
+            if selection_counts(&offer, now, &edit.insert, &doc.text, byte) {
+                picked.push(edit.insert.clone());
+            }
+        }
+        if picked.is_empty() {
+            return;
+        }
+        let Some(mru) = self.ensure_mru(&root) else {
+            return;
+        };
+        for class in &picked {
+            mru_update(mru, class);
+        }
+        let saved = mru.clone();
+        save_mru(&root, &saved);
+    }
+}
 
 fn completion_language(language: &str) -> bool {
     COMPLETION_LANGUAGES.contains(&language)
@@ -456,6 +623,141 @@ fn class_value_prefix(
     None
 }
 
+fn mru_update(mru: &mut Vec<String>, class: &str) {
+    mru.retain(|existing| existing != class);
+    mru.insert(0, class.to_string());
+    mru.truncate(MRU_SIZE);
+}
+
+/// MRU hits first (newest first), then the remaining names in their current order.
+fn rank_matches(candidates: &[String], mru: &[String]) -> Vec<String> {
+    let mut ranked: Vec<String> = mru.iter().filter(|class| candidates.contains(*class)).cloned().collect();
+    ranked.extend(candidates.iter().filter(|class| !mru.contains(*class)).cloned());
+    ranked
+}
+
+fn offer_is_fresh(offer: &Offer, now: u64) -> bool {
+    now.saturating_sub(offer.created_unix) <= OFFER_TTL_SECS
+}
+
+fn label_eq(offer: &Offer, inserted: &str) -> bool {
+    offer.labels.iter().any(|label| label == inserted)
+}
+
+/// Exact offered label, still fresh, and the caret after the insert sits in `class`.
+fn selection_counts(offer: &Offer, now: u64, inserted: &str, text: &str, end_byte: usize) -> bool {
+    offer_is_fresh(offer, now) && label_eq(offer, inserted) && class_value_prefix(text, end_byte).is_some()
+}
+
+/// Byte offset of the end of `insert` in the document after the edit.
+/// `from` is a UTF-16 offset in the pre-edit text; `shift_utf16` is the
+/// UTF-16 delta of earlier edits in the same change set.
+fn insertion_end_byte(text: &str, from: u32, insert: &str, shift_utf16: i64) -> Option<usize> {
+    let end = i64::from(from) + shift_utf16 + i64::from(utf16_len(insert));
+    if end < 0 || end > i64::from(u32::MAX) {
+        return None;
+    }
+    let pos = position_utf16(text, end as u32)?;
+    offset(text, pos)
+}
+
+fn utf16_len(text: &str) -> u32 {
+    text.chars().map(|ch| ch.len_utf16() as u32).sum()
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A64_OFFSET;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+    hash
+}
+
+fn mru_key(root: &str) -> String {
+    format!("mru:v1:{:016x}", fnv1a64(normalize_root(root).as_bytes()))
+}
+
+fn serialize_mru(mru: &[String]) -> String {
+    mru.iter().take(MRU_SIZE).cloned().collect::<Vec<_>>().join("\n")
+}
+
+fn parse_mru(raw: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in raw.split(['\n', '\r']) {
+        let name = line.trim();
+        if !valid_class_name(name) || names.iter().any(|existing| existing == name) {
+            continue;
+        }
+        names.push(name.to_string());
+        if names.len() == MRU_SIZE {
+            break;
+        }
+    }
+    names
+}
+
+fn valid_class_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_digit() || !(first.is_alphanumeric() || first == '_' || first == '-') {
+        return false;
+    }
+    chars.all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn save_mru(root: &str, mru: &[String]) {
+    let _ = host::storage::set(&mru_key(root), &serialize_mru(mru));
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or(0)
+}
+
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn normalize_root(root: &str) -> String {
+    normalize_path(root).trim_end_matches('/').to_string()
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    let path = normalize_path(path);
+    path.starts_with('/')
+        || path.as_bytes().get(1) == Some(&b':') && path.as_bytes().get(2) == Some(&b'/')
+}
+
+fn offer_key(path: &str, root: &str) -> String {
+    let path = normalize_path(path);
+    let root = normalize_root(root);
+    if is_absolute_path(&path) {
+        path
+    } else {
+        format!("{root}/{}", path.trim_start_matches('/'))
+    }
+}
+
+fn resolve_root(path: &str, ctx: &Invocation) -> Option<String> {
+    if let Some(project) = host::project_of(path)
+        && let Ok(root) = project.root()
+    {
+        return Some(normalize_root(&root));
+    }
+    ctx.project().and_then(|project| project.root().ok()).map(|root| normalize_root(&root))
+}
+
+fn read_document(path: &str, ctx: &Invocation) -> Option<openidea_plugin::Document> {
+    if let Some(project) = host::project_of(path)
+        && let Ok(doc) = project.document(path)
+    {
+        return Some(doc);
+    }
+    ctx.project()?.document(path).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +861,270 @@ mod tests {
     #[test]
     fn mid_token_replacement() {
         check_btn_token(r#"<div class="other btn-primary"></div>"#, "btn-primary");
+    }
+
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn sample_mru() -> Vec<String> {
+        names(&["box__blue", "btn", "container", "card", "text-muted"])
+    }
+
+    #[test]
+    fn rank_puts_recent_prefix_matches_first_without_hiding_the_rest() {
+        let mru = sample_mru();
+        assert_eq!(
+            rank_matches(&names(&["box", "box__blue", "box__border"]), &mru),
+            names(&["box__blue", "box", "box__border"])
+        );
+        assert_eq!(
+            rank_matches(&names(&["badge", "banner", "box", "box__blue", "box__border", "btn", "button"]), &mru),
+            names(&["box__blue", "btn", "badge", "banner", "box", "box__border", "button"])
+        );
+        assert_eq!(rank_matches(&names(&["xyz", "xyz-a"]), &mru), names(&["xyz", "xyz-a"]));
+        assert_eq!(
+            rank_matches(
+                &names(&["badge", "box", "box__blue", "btn", "card", "container", "text-muted", "zebra"]),
+                &mru
+            ),
+            names(&["box__blue", "btn", "container", "card", "text-muted", "badge", "box", "zebra"])
+        );
+        assert_eq!(
+            rank_matches(&names(&["box", "card"]), &names(&["gone", "box"])),
+            names(&["box", "card"])
+        );
+    }
+
+    #[test]
+    fn mru_update_moves_repeat_to_front_and_drops_the_oldest() {
+        let mut mru = sample_mru();
+        mru_update(&mut mru, "btn");
+        assert_eq!(mru, names(&["btn", "box__blue", "container", "card", "text-muted"]));
+        mru_update(&mut mru, "badge");
+        assert_eq!(mru, names(&["badge", "btn", "box__blue", "container", "card"]));
+        assert!(!mru.contains(&"text-muted".to_string()));
+    }
+
+    fn offer(labels: &[&str], created_unix: u64) -> Offer {
+        Offer {
+            labels: names(labels),
+            replace: Range::default(),
+            version: 1,
+            created_unix,
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn offer_matching_accepts_only_a_fresh_exact_label_inside_class() {
+        let html = r#"<div class="box__blue">"#;
+        let at = html.rfind('"').unwrap();
+        let fresh = offer(&["box__blue", "btn"], 100);
+        assert!(selection_counts(&fresh, 100, "box__blue", html, at));
+        assert!(selection_counts(&fresh, 110, "box__blue", html, at), "age of 10s still counts");
+        assert!(!selection_counts(&fresh, 100, "b", html, at));
+        assert!(!selection_counts(&fresh, 100, "pasted", html, at));
+        assert!(!selection_counts(&fresh, 111, "box__blue", html, at));
+
+        let outside = r#"<div class="ok"><p>box__blue</p>"#;
+        let body = outside.rfind("box__blue").unwrap() + "box__blue".len();
+        assert!(!selection_counts(&fresh, 100, "box__blue", outside, body));
+    }
+
+    #[test]
+    fn insertion_end_uses_utf16_offsets_in_the_edited_text() {
+        let text = "<div title=\"😀\" class=\"box__blue\">";
+        let start = text.find("box__blue").unwrap();
+        let from = utf16_len(&text[..start]);
+        let end = insertion_end_byte(text, from, "box__blue", 0).unwrap();
+        assert_eq!(&text[start..end], "box__blue");
+        assert!(class_value_prefix(text, end).is_some());
+        assert_ne!(from as usize, start, "the emoji shifts bytes away from UTF-16");
+    }
+
+    #[test]
+    fn mru_storage_roundtrip_skips_broken_lines_and_keeps_five() {
+        let names = names(&["box__blue", "btn", "container", "card", "text-muted"]);
+        assert_eq!(parse_mru(&serialize_mru(&names)), names);
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(
+            parse_mru("box__blue\n\n   \nnot a class\n!!!\nbtn\ncontainer\ncard\ntext-muted\nextra\n"),
+            names
+        );
+        assert!(mru_key("/project").starts_with("mru:v1:"));
+        assert_ne!(mru_key("/project"), mru_key("/other"));
+    }
+
+    #[test]
+    fn pending_offers_keep_the_sixteen_newest() {
+        let mut main = Main::default();
+        for index in 0..MAX_PENDING_OFFERS + 1 {
+            main.remember_offer(
+                format!("/project/f{index}.html"),
+                offer(&["box"], index as u64),
+            );
+        }
+        assert_eq!(main.offers.len(), MAX_PENDING_OFFERS);
+        assert!(!main.offers.contains_key("/project/f0.html"));
+        assert!(main.offers.contains_key(&format!("/project/f{MAX_PENDING_OFFERS}.html")));
+    }
+
+    #[test]
+    fn picked_class_is_stored_and_ranked_after_restart() {
+        let mock = openidea_plugin::mock::MockHost::install();
+        mock.add_file("src/app.css", ".box { color: red } .box__blue { } .box__border { } .btn { }");
+        let mut plugin = Main::default();
+        plugin.activate(&openidea_plugin::Context::default()).unwrap();
+        let globs = mock.path_subscriptions()["document-changed"].clone();
+        assert_eq!(
+            globs,
+            [
+                "**/*.html",
+                "**/*.vue",
+                "**/*.php",
+                "**/*.twig",
+                "**/*.js",
+                "**/*.jsx",
+                "**/*.ts",
+                "**/*.tsx",
+                "**/*.svelte",
+            ]
+        );
+
+        let before = r#"<div class="box">"#;
+        let after = r#"<div class="box__blue">"#;
+        mock.open_editor("/project/index.html", "html", after, &[]);
+        let doc = Document {
+            path: "/project/index.html".into(),
+            language: "html".into(),
+            version: 1,
+            text: before.into(),
+        };
+        let cursor = before.find("box").unwrap() + "box".len();
+        let items = plugin.completion(&doc, position(before, cursor), None);
+        assert_eq!(
+            items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
+            ["box", "box__blue", "box__border"]
+        );
+        assert_eq!(items[0].sort_text.as_deref(), Some("0000"));
+        assert_eq!(items[0].detail.as_deref(), Some("CSS class"));
+        assert!(mock.storage().is_empty());
+
+        let start = after.find("box__blue").unwrap();
+        let from = utf16_len(&after[..start]);
+        plugin.handle_events(
+            &[Event::DocumentChanged(DocumentChanged {
+                path: "index.html".into(),
+                base_version: 0,
+                version: mock.editor_version(),
+                changes: vec![openidea_plugin::DocumentTextChange {
+                    from,
+                    to: from + utf16_len("box"),
+                    insert: "box__blue".into(),
+                }],
+            })],
+            &mock.invocation(),
+        );
+        assert_eq!(mock.storage().get(&mru_key("/project")).map(String::as_str), Some("box__blue"));
+
+        plugin.handle_events(
+            &[Event::DocumentChanged(DocumentChanged {
+                path: "index.html".into(),
+                base_version: 1,
+                version: mock.editor_version(),
+                changes: vec![openidea_plugin::DocumentTextChange {
+                    from,
+                    to: from,
+                    insert: "b".into(),
+                }],
+            })],
+            &mock.invocation(),
+        );
+        assert_eq!(mock.storage().get(&mru_key("/project")).map(String::as_str), Some("box__blue"));
+
+        plugin.remember_offer(
+            "/project/index.html".into(),
+            Offer {
+                labels: names(&["box__blue", "btn"]),
+                replace: Range::default(),
+                version: 1,
+                created_unix: 0,
+                seq: 0,
+            },
+        );
+        plugin.handle_events(
+            &[Event::DocumentChanged(DocumentChanged {
+                path: "index.html".into(),
+                base_version: 1,
+                version: mock.editor_version(),
+                changes: vec![openidea_plugin::DocumentTextChange {
+                    from,
+                    to: from,
+                    insert: "btn".into(),
+                }],
+            })],
+            &mock.invocation(),
+        );
+        assert_eq!(
+            mock.storage().get(&mru_key("/project")).map(String::as_str),
+            Some("box__blue"),
+            "an offer older than 10s does not count"
+        );
+
+        let mut restarted = Main::default();
+        let again = restarted.completion(&doc, position(before, cursor), None);
+        assert_eq!(
+            again.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
+            ["box__blue", "box", "box__border"]
+        );
+        assert_eq!(again[0].detail.as_deref(), Some("CSS class · recently used"));
+        assert_eq!(again[1].detail.as_deref(), Some("CSS class"));
+        assert!(again.iter().all(|item| item.label != "btn"));
+    }
+
+    #[test]
+    fn two_projects_store_independent_mru_lists() {
+        let mock = openidea_plugin::mock::MockHost::install();
+        mock.set_project_root(Some("/proj-a"));
+        mock.add_project("/proj-b");
+        mock.add_file("src/app.css", ".box__blue { } .btn { }");
+
+        let mut plugin = Main::default();
+        select_class(&mock, &mut plugin, "/proj-a/index.html", "box__blue");
+        mock.add_project("/proj-a");
+        mock.set_project_root(Some("/proj-b"));
+        select_class(&mock, &mut plugin, "/proj-b/page.html", "btn");
+
+        assert_eq!(mock.storage().get(&mru_key("/proj-a")).map(String::as_str), Some("box__blue"));
+        assert_eq!(mock.storage().get(&mru_key("/proj-b")).map(String::as_str), Some("btn"));
+    }
+
+    fn select_class(mock: &openidea_plugin::mock::MockHost, plugin: &mut Main, path: &str, class: &str) {
+        let text = format!(r#"<div class="{class}">"#);
+        mock.open_editor(path, "html", &text, &[]);
+        let doc = Document {
+            path: path.into(),
+            language: "html".into(),
+            version: mock.editor_version(),
+            text: text.clone(),
+        };
+        let cursor = text.find(class).unwrap() + class.len();
+        let _ = plugin.completion(&doc, position(&text, cursor), None);
+        let from = utf16_len(&text[..text.find(class).unwrap()]);
+        plugin.handle_events(
+            &[Event::DocumentChanged(DocumentChanged {
+                path: path.into(),
+                base_version: 0,
+                version: mock.editor_version(),
+                changes: vec![openidea_plugin::DocumentTextChange {
+                    from,
+                    to: from,
+                    insert: class.into(),
+                }],
+            })],
+            &mock.invocation(),
+        );
     }
 }

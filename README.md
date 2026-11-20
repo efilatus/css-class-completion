@@ -2,9 +2,12 @@
 
 An OpenIDEA plugin that provides CSS class name completion from your project stylesheets.
 
+Version 0.2.0.
+
 ## Features
 
 - **CSS class completion** — suggests class names while typing inside `class` attributes.
+- **Recent selections first** — the last 5 classes you picked from completion stay on top, per project, persisted across restarts.
 - **Multiple languages** — works in HTML, Vue, PHP, Twig, JavaScript, TypeScript, and Svelte documents.
 - **Multiple stylesheet formats** — extracts class names from `.css`, `.scss`, and `.less` files, including CSS Modules (`*.module.css` / `*.module.scss` / `*.module.less`).
 - **Prefix matching** — filters suggestions based on the text already entered.
@@ -25,7 +28,7 @@ The plugin searches the current project for CSS, SCSS, and LESS files, extracts 
 ## Requirements
 
 - OpenIDEA 1.6 or later.
-- The `project.read` capability must be granted so the plugin can read project files.
+- The `project.read`, `editor.read`, `events`, and `storage` capabilities must be granted. OpenIDEA asks again when the plugin is updated.
 
 ## Development
 
@@ -49,6 +52,8 @@ This loads the plugin folder in OpenIDEA. You can manage linked plugins in **Set
 
 ## Limitations
 
+- Only a class picked from the completion list changes suggestion order. Typing a class by hand or pasting it does not.
+- Recent selections stay on this machine. The plugin does not write them into project files.
 - Completion triggers inside `class` attributes only — JSX `className`, Vue `:class` bindings, and `classList.add()` calls are not supported yet.
 - Class names are extracted using a lightweight parser, not a full CSS parser: SCSS nesting with `&` (e.g. BEM `&__element`) is not expanded into full class names.
 - Tailwind utility classes are only suggested if they exist in a stylesheet — they are not generated on the fly.

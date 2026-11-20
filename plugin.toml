@@ -1,7 +1,7 @@
 
 id = "efilatus.css-class-completion"
 name = "CSS Class Completion"
-version = "0.1.2"
+version = "0.2.0"
 description = "Completion for CSS classes from project stylesheets."
 authors = []
 categories = ["tools"]
@@ -9,7 +9,7 @@ engines.openidea = "^1.6"
 wasm = "dist/plugin.wasm"
 
 [capabilities]
-required = ["project.read"]
+required = ["project.read", "editor.read", "events", "storage"]
 
 [[contributes.providers]]
 kinds = ["completion"]
